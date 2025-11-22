@@ -8,16 +8,20 @@
 #endif
 
 /* POLYPHONIC LOGIC STRUCTURE:
-ISR 1 (20 kHz):    update oscillators, write audio
-ISR 2 (500 Hz):    update envelopes, LFOs
-ISR 3:             parse MIDI
-main loop:         do nothing (or UI only)
+ISR (20 kHz):    update oscillators, write audio
+                 send flags to update envelopes, LFOs, voice allocation
+
+main loop:       update envelopes & voice arr, handle serial i/o 
 */
+//ADSR params
+const int potA, potD, potS, potR; //potentiometer values
+const int A, D, S, R; //time values
 const int freq = 10; //temp value of 10 hz for frequency
 const int NUMVOICES = 4;
 const int bits_phase_accumulator = 32;
-const int samplerate = 1000; //1k Hz sample rate (for debug)
+const int Fs = 1000; //1k Hz sample rate (for debug)
 volatile unsigned long samplecnt = 0;
+volatile bool voicemixflag, envupdateflag = false;
 volatile int output = 0;
 const int WAVETABLE_SIZE = 256;
 typedef enum {OFF, ATTACK, DECAY, SUSTAIN, RELEASE} EnvelopeStage;
@@ -30,7 +34,7 @@ typedef struct {
 } Voice;
 
 typedef struct {
-  volatile bool active; int name;
+  volatile bool active; volatile int name;
 } Input;
 
 Voice edgar[NUMVOICES];
@@ -51,7 +55,7 @@ uint8_t triangletable[WAVETABLE_SIZE];
 void generate_wavetables();
 void init_voicearray(Voice *);
 void key_off(Voice);
-void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice v);
+void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs);
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 
 
@@ -71,13 +75,42 @@ void setup() {
 
 void loop() {
   // put your main code here, to run repeatedly:
+  //input logic
   if (Serial.available()) {
       parse_int  = Serial.parseInt();
-      if (parse_int <= 1 || parse_int >= 8) {
+      if (parse_int < 1 || parse_int > 8) {
         Serial.println("error! input must be between 1-8.");
-        key.active = false;
+        key.active = false; voicemixflag = false;
       }
       else {key.active = true; key.name = parse_int;}
+  }
+  //voice allocation logic
+  if (voicemixflag) {
+    unsigned long oldest_start = UINT32_MAX;; int i_oldest = 0; bool foundvoice = false;
+      for (int i=0; i<NUMVOICES; i++) {
+        //if a key is pressed a second time, turn it off
+        if (edgar[i].name == key.name) {key_off(edgar[i]); foundvoice = true; break;}
+        //else, if a key i pressed for the first time, find a place for it
+        //find any off voices
+        if (edgar[i].on == false) {key_on(SINE, samplecnt, freq, &edgar[i], Fs); foundvoice=true; break;}
+        if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
+      }
+      //if no off voices found, replace the oldest
+      if (foundvoice==false) {key_on(SINE, samplecnt, freq, &edgar[i_oldest], Fs);}
+      key.active = false; //reset input event flag
+      voicemixflag = false; //reset ISR->voice allocation flag
+  }
+  //envelope update logic
+  if (envupdateflag) {
+    /* I set a flag to be set active every 4 counts in ISR, and an if statement in loop() to handle envelope update logic. 
+    Since all the heavy math is done in loop(), I'll have a function to convert my const int potA, potD, potS, potR; 
+    to A, D, S, R; in the beginning of the if statement. I could generate a high-resolution logarithmic wavetable for each 
+    attack, decay, and release, and use A, D, S, R to control how many counts i increment through each depending on how fast 
+    or slow the ADSR parameters are. */
+    
+  }
+
+
 } //loop()
 
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
@@ -124,24 +157,12 @@ ISR(TIMER1_COMPA_vect) {
   //UPDATE ENVELOPES
 
   //VOICE HANDLING
-  if ((samplecnt & 15) == 0) {
-    if (key.active) {
-      unsigned long oldest_start = UINT32_MAX;; int i_oldest = 0; bool foundvoice = false;
-      for (int i=0; i<NUMVOICES; i++) {
-        //if a key is pressed a second time, turn it off
-        if (edgar[i].name == key.name) {key_off(edgar[i]); foundvoice = true; break;}
-        //else, if a key i pressed for the first time, find a place for it
-        //find any off voices
-        if (edgar[i].on == false) {key_on(SINE, samplecnt, freq, edgar[i]); foundvoice=true; break;}
-        if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
-      }
-      //if no off voices found, replace the oldest
-      if (foundvoice==false) {key_on(SINE, samplecnt, freq, edgar[i_oldest]);}
-      key.active = false;
-    }
-  }
-  
-}
+  if ((samplecnt & 15) == 0)
+    if (key.active) voicemixflag = true;
+
+  //Update LFO
+  if (samplecnt & 3 == 0) envupdateflag = true;
+} //ISR
 
 
 
@@ -202,7 +223,11 @@ void key_off(Voice v) {
   v->name = 67; v->stage = RELEASE; v->on = false;
 }
 
-void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice v) {
+void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs) {
   v->startcnt = startcnt; v->f = freq; v->stage = ATTACK; v->osc = osc;
+
+  v->phase_inc = (unsigned long) ((double)v->f * (unsigned long) (1 << bits_phase_accumulator) / Fs);
+  v->phase = 0; v-> on = true;
+
 }
 
