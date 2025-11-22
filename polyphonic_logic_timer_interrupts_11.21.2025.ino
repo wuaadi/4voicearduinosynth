@@ -46,6 +46,10 @@ uint8_t sinetable[WAVETABLE_SIZE];
 uint8_t squaretable[WAVETABLE_SIZE];
 uint8_t sawtable[WAVETABLE_SIZE];
 uint8_t triangletable[WAVETABLE_SIZE];
+//asdr tables
+uint8_t Atable[WAVETABLE_SIZE];
+uint8_t Dtable[WAVETABLE_SIZE];
+uint8_t Rtable[WAVETABLE_SIZE];
 
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 
@@ -53,6 +57,7 @@ uint8_t triangletable[WAVETABLE_SIZE];
 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-*/
 
 void generate_wavetables();
+void generate_env_tables(EnvelopeStage stage, float lambda, uint8_t * table);
 void init_voicearray(Voice *);
 void key_off(Voice);
 void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs);
@@ -71,6 +76,11 @@ void setup() {
   Serial.println("SQUARE:"); for (int i=0;i<255;i++) Serial.print((int)squaretable[i]);
   Serial.println("SAW:"); for (int i=0;i<255;i++) Serial.print((int)sawtable[i]);
   Serial.println("TRIANGLE:"); for (int i=0;i<255;i++) Serial.print((int)triangletable[i]);
+  float lambda_decay = 0.02f;
+  float lambda_release = 0.005f;
+  generate_env_tables(ATTACK, 0, Atable);
+  generate_env_tables(DECAY, lambda_decay, Dtable);
+  generate_env_tables(RELEASE, lambda_release, Rtable);
 } //setup
 
 void loop() {
@@ -168,7 +178,7 @@ ISR(TIMER1_COMPA_vect) {
 
 /*USER_DEFINED_FXS
 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-*/
-void generate_wavetables(OscillatorType osc, uint8_t * table) {
+/*void generate_wavetables(OscillatorType osc, uint8_t * table) {
   Serial.print("\n\n");
   if (osc == SINE) {
    Serial.print("SINE TABLE:\n");
@@ -193,7 +203,25 @@ void generate_wavetables(OscillatorType osc, uint8_t * table) {
       Serial.println((int)table[i]);
     }
   }
-} //generate_wavetables
+} //generate_wavetables */
+
+void generate_env_tables(EnvelopeStage stage, float lambda, uint8_t * table) {
+  if (stage == RELEASE || stage == DECAY){
+    for (int i = 0; i < WAVETABLE_SIZE; i++) {
+            float val = 255.0f * expf(-lambda * i);
+            if (val < 0) val = 0;
+            table[i] = (uint8_t)val;
+        }
+    }
+  }
+  else if (stage == ATTACK) {
+    for (int i = 0; i < TABLE_SIZE; i++) {
+      table[i] = (uint8_t)255 * pow((i / WAVETABLE_SIZE - 1), 2);
+    }
+  }
+  else {Serial.println("error: choose an envelope stage."); return;}
+}
+
 
 void init_voicearray(Voice * edgar) {
   for (int i=0; i<NUMVOICES; i++) {edgar[i].on=false; edgar[i].amp=0; edgar[i].stage=OFF; edgar[i].osc=SINE; 
