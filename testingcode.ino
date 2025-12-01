@@ -26,7 +26,7 @@ const int NUMVOICES = 4;
 const int bits_phase_accumulator = 32;
 const int Fs = 20000; //20k Hz sample rate
 volatile unsigned long samplecnt = 0;
-volatile bool voicemixflag, envupdateflag, printflag = false;
+volatile bool voicemixflag, envupdateflag, printflag, LEDflag = false;
 uint16_t output = 0; //0-255
 int output_voltage; //0-5 volts
 const int WAVETABLE_SIZE = 256;
@@ -116,8 +116,8 @@ void printSerial(Voice* v);
 
 void setup() {
   //PWM and GATE outputs
-  pinMode(11, OUTPUT); //Audio output
-  pinMode(10, OUTPUT); //light or sm idk
+  pinMode(11, OUTPUT); //mixed output
+  pinMode(3, OUTPUT); pinMode(5, OUTPUT); pinMode(6, OUTPUT); pinMode(9, OUTPUT); //individual voices
   //timer setup
   cli();
   TCCR1A = 0; // Normal operation 
@@ -174,6 +174,15 @@ void loop() {
   }
   //envelope update logic
   if (envupdateflag) {
+    /* I set a flag to be set active every 4 counts in ISR, and an if statement in loop() to handle envelope update logic. 
+    Since all the heavy math is done in loop(), I'll have a function to convert my const int potA, potD, potS, potR; 
+    to msA, msD, msS, msR; in the beginning of the if statement. I could generate a high-resolution logarithmic wavetable for each 
+    attack, decay, and release, and use A, D, S, R to control how many counts i increment through each depending on how fast 
+    or slow the ADSR parameters are. */
+
+    //digitalread potentiometer values to potA, potD .....
+    //convert them
+    
     //increment thru ADR wavetables
     for (int i=0; i<NUMVOICES; i++) {
       incrementADSR(&edgar[i]); //updates envIndex, stage, and env_amp
@@ -196,11 +205,20 @@ void loop() {
         Serial.println((String) "     name: "+ edgar[i].name + " stage: "+ edgar[i].stage +" pos: "+ i);
       }
     }
+    Serial.print("TOTAL MIXED OUTPUT: "); Serial.println(output);
     Serial.println("-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-="); Serial.println();
 
     printflag = false;
   }
 
+  if (LEDflag) {
+    analogWrite(3, edgar[0].env_amp);
+    /*
+    ADD after getting my resistors:
+    analogWrite(5, edgar[1].env_amp); analogWrite(6, edgar[2].env_amp); analogWrite(9, edgar[3].env_amp);
+    */
+    LEDflag = false;
+  }
 
 } //loop()
 
@@ -208,6 +226,22 @@ void loop() {
 
 
 ISR(TIMER1_COMPA_vect) {
+  /*
+  On every sample interrupt (20 kHz):
+    sample_counter++
+
+    do oscillator phase increments
+    do wavetable lookup
+    mix voices
+    output sample
+
+    if sample_counter % 40 == 0:
+         update envelopes
+
+    if sample_counter % 16 == 0: 
+         update voices
+
+  */
   samplecnt++;
   //WAVETABLE GENERATION /
   for (int i=0; i<NUMVOICES; i++) {
@@ -239,7 +273,9 @@ ISR(TIMER1_COMPA_vect) {
   //Update ENVELOPE
   if ((samplecnt & 39) == 0) envupdateflag = true; //run every 40 samples
 
-  //print for debugging
+  //LED
+  if ((samplecnt & 99) == 0) LEDflag = true;
+  //printing
   if ((samplecnt & 59999) == 0) printflag = true;
 } //ISR
 
@@ -300,7 +336,6 @@ void incrementADSR(Voice* v) {
     v->envIndex += v->a_inc;
     if (v->envIndex >= WAVETABLE_SIZE)
       {v->stage = DECAY; v->envIndex -= WAVETABLE_SIZE;}
-    //if (!v->on) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
   }
   else if (v->stage == DECAY) {
     v->envIndex += v->d_inc;
