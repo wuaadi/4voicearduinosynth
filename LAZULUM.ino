@@ -47,7 +47,7 @@ typedef struct {
 } Input;
 
 Voice edgar[NUMVOICES];
-Input key {67, false};
+Input key {false, 67};
 
 /*WAVETABLES
 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-*/
@@ -107,7 +107,7 @@ uint8_t Rtable[WAVETABLE_SIZE];
 void generate_env_tables(EnvelopeStage stage, float lambda, float sustain, uint8_t * table);
 void init_voicearray(Voice *);
 void key_off(Voice *);
-void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs);
+void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs, int name);
 uint8_t convertADSR(int);
 void incrementADSR(Voice* v);
 void printSerial(Voice* v);
@@ -137,7 +137,7 @@ void setup() {
   init_voicearray(edgar);
 
   float lambda_decay = 0.02f;
-  float lambda_release = 0.005f;
+  float lambda_release = 0.01f;
   float sustain = 0.5;
   generate_env_tables(ATTACK, 0, sustain, Atable);
   generate_env_tables(DECAY, lambda_decay, sustain, Dtable);
@@ -157,7 +157,7 @@ void loop() {
   }
   //voice allocation logic
   if (voicemixflag) {
-    unsigned long oldest_start = UINT32_MAX;; int i_oldest = 0; bool foundvoice = false;
+    unsigned long oldest_start = UINT32_MAX; int i_oldest = 0; bool foundvoice = false;
       for (int i=0; i<NUMVOICES; i++) {
         //if a key is pressed a second time, turn it off
         if (edgar[i].name == key.name) {key_off(&edgar[i]); foundvoice = true; break;}
@@ -279,20 +279,22 @@ void generate_env_tables(EnvelopeStage stage, float lambda, float sustain, uint8
   if (stage == RELEASE){
     for (int i = 0; i < WAVETABLE_SIZE; i++) {
             float val = 255.0f * expf(-lambda * i);
-            if (val < 0) val = 0;
-            table[i] = (uint8_t)val;
+            if (val < 25) val = 0;
+            table[i] = (uint8_t)val; Serial.print(table[i]); Serial.print(",");
     }
   }
   else if (stage == DECAY) {
     for (int i = 0; i < WAVETABLE_SIZE; i++) {
       float e = expf(-lambda * i);
       float val = sustain + (1.0 - sustain) * e; 
-      table[i] = (uint8_t)(255.0f * val);
+      table[i] = (uint8_t)(255.0f * val); Serial.print(table[i]); Serial.print(",");
     }
   }
   else if (stage == ATTACK) {
     for (int i = 0; i < WAVETABLE_SIZE; i++) {
-      table[i] = (uint8_t)255 * pow((i / WAVETABLE_SIZE - 1), 2);
+      table[i] = (uint8_t) ((uint16_t)(i * i) / 255);
+      //table[i] = (uint8_t)(255 * ( 1.0 * (float) pow((i / WAVETABLE_SIZE - 1), 2))); 
+      Serial.print(table[i]); Serial.print(",");
     }
   }
   else {Serial.println("error: choose an envelope stage."); return;}
@@ -309,9 +311,9 @@ void key_off(Voice * v) {
   v->name = 67; v->on = false;
 }
 
-void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs) {
+void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs, int name) {
   v->startcnt = startcnt; v->f = freq; v->stage = ATTACK; v->osc = osc;
-  v->envIndex = 0;
+  v->envIndex = 0; v->name = name;
   v->phase_inc = (unsigned long) ((double)v->f * (unsigned long) (1 << bits_phase_accumulator) / Fs);
   v->phase = 0; v-> on = true;
   v->a_inc = convertADSR(potA); v->d_inc = convertADSR(potD); v->r_inc = convertADSR(potR);
@@ -325,7 +327,6 @@ void incrementADSR(Voice* v) {
     v->envIndex += v->a_inc;
     if (v->envIndex >= WAVETABLE_SIZE)
       {v->stage = DECAY; v->envIndex -= WAVETABLE_SIZE;}
-    //if (!v->on) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
   }
   else if (v->stage == DECAY) {
     v->envIndex += v->d_inc;
@@ -353,6 +354,7 @@ void incrementADSR(Voice* v) {
     case RELEASE: v->env_amp = (Rtable[v->envIndex] * v->amp_before_r) >> 8; break;
   }
 }
+
 
 /* OLD
 void generate_wavetables() {
