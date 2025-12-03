@@ -34,7 +34,7 @@ typedef enum {OFF, ATTACK, DECAY, SUSTAIN, RELEASE} EnvelopeStage;
 typedef enum {SINE, SQUARE, SAW, TRIANGLE} OscillatorType;
 
 typedef struct {
-  bool on; int name; uint16_t amp; uint8_t raw; uint8_t env_amp;
+  bool pressed; int name; uint16_t amp; uint8_t raw; uint8_t env_amp;
   EnvelopeStage stage; OscillatorType osc; 
   uint32_t phase; uint32_t phase_inc; unsigned long startcnt;
   uint16_t envIndex; uint32_t f; //frequency
@@ -157,19 +157,23 @@ void loop() {
   }
   //voice allocation logic
   if (voicemixflag) {
-    unsigned long oldest_start = UINT32_MAX; int i_oldest = 0; bool foundvoice = false;
+    unsigned long oldest_start = UINT32_MAX; int i_oldest = 0; bool foundexisting, foundoff = false;
       for (int i=0; i<NUMVOICES; i++) {
         //if a key is pressed a second time, turn it off
-        if (edgar[i].name == key.name) {key_off(&edgar[i]); foundvoice = true; break;}
-        //else, if a key i pressed for the first time, find a place for it
-        //find any off voices
-        if (edgar[i].on == false) {key_on(SINE, samplecnt, freq, &edgar[i], Fs); foundvoice=true; break;}
-        if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
+        if (edgar[i].name == key.name) {key_release(&edgar[i]); foundexisting = true; break;}
       }
-      //if no off voices found, replace the oldest
-      if (foundvoice==false) {key_on(SINE, samplecnt, freq, &edgar[i_oldest], Fs);}
-      key.active = false; //reset input event flag
-      voicemixflag = false; //reset ISR->voice allocation flag
+      if (foundexisting == false) {
+        for (int i=0; i<NUMVOICES; i++) {
+          //else, if a key i pressed for the first time, find a place for it
+          //find any off voices
+          if (edgar[i].stage == OFF) {key_press(SINE, samplecnt, freq, &edgar[i], Fs, key.name); foundoff=true; break;}
+          if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
+        }
+      }
+      //if no off/existing voices found, replace the oldest
+      if (foundexisting==false && foundoff==false) {key_press(SINE, samplecnt, freq, &edgar[i_oldest], Fs, key.name);}
+    key.active = false; //reset input event flag
+    voicemixflag = false; //reset ISR->voice allocation flag
   }
   //envelope update logic
   if (envupdateflag) {
@@ -302,20 +306,24 @@ void generate_env_tables(EnvelopeStage stage, float lambda, float sustain, uint8
 
 void init_voicearray(Voice * edgar) {
   for (int i=0; i<NUMVOICES; i++) {
-    edgar[i].on=false; edgar[i].amp=0; edgar[i].stage=OFF; edgar[i].osc=SINE; 
+    edgar[i].pressed=false; edgar[i].amp=0; edgar[i].stage=OFF; edgar[i].osc=SINE; 
     edgar[i].name = 67; edgar[i].phase = 0; edgar[i].phase_inc= 0; edgar[i].envIndex = 0; edgar[i].f = 20; // 20 hz
   } 
 }//init_voicearray
 
-void key_off(Voice * v) {
-  v->name = 67; v->on = false;
+void key_release(Voice * v) {
+  v->pressed = false;
 }
 
-void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs, int name) {
+void key_off(Voice * v) {
+  v->stage = OFF; v->name = 67; v->env_amp=0;
+}
+
+void key_press(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs, int name) {
   v->startcnt = startcnt; v->f = freq; v->stage = ATTACK; v->osc = osc;
   v->envIndex = 0; v->name = name;
   v->phase_inc = (unsigned long) ((double)v->f * (unsigned long) (1 << bits_phase_accumulator) / Fs);
-  v->phase = 0; v-> on = true;
+  v->phase = 0; v-> pressed = true;
   v->a_inc = convertADSR(potA); v->d_inc = convertADSR(potD); v->r_inc = convertADSR(potR);
 }
 
@@ -325,6 +333,9 @@ void incrementADSR(Voice* v) {
   //update envelope index & stages, handle overflow
   if (v->stage == ATTACK) {
     v->envIndex += v->a_inc;
+    if (!v->pressed) {
+      v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;
+    }
     if (v->envIndex >= WAVETABLE_SIZE)
       {v->stage = DECAY; v->envIndex -= WAVETABLE_SIZE;}
   }
@@ -333,24 +344,24 @@ void incrementADSR(Voice* v) {
     if (v->envIndex >= WAVETABLE_SIZE)
       {
         v->envIndex -= WAVETABLE_SIZE;
-        if (!v->on) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
+        if (!v->pressed) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
         else {v->stage = SUSTAIN;}
       }
   }
   else if (v->stage == SUSTAIN) {
-    if (!v->on) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
+    if (!v->pressed) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
   }
 
   else if (v->stage == RELEASE) {
     v->envIndex += v->r_inc;
-    if (v->envIndex >= WAVETABLE_SIZE) {v->stage = OFF; v->envIndex = 0;}
+    if (v->envIndex >= WAVETABLE_SIZE) {key_off(v);}
   }
 
   //update envelope amplitude
   switch (v->stage) {
     case ATTACK: v->env_amp = Atable[v->envIndex]; break;
     case DECAY: v->env_amp = Dtable[v->envIndex]; break;
-    case SUSTAIN: break; //keep amplitude constant
+    case SUSTAIN: v->env_amp = 128; break; //keep amplitude constant
     case RELEASE: v->env_amp = (Rtable[v->envIndex] * v->amp_before_r) >> 8; break;
   }
 }
