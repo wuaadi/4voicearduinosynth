@@ -4,7 +4,6 @@ test code for LAZULUM--test different functions with serial, breadboard, etc.
 
 #include <math.h>
 #include <stdio.h>
-#include <MIDI.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
 
@@ -19,31 +18,37 @@ ISR (20 kHz):    update oscillators, write audio
 
 main loop:       update envelopes & voice arr, handle serial i/o 
 */
-//ADSR params
-int potA, potD, potR; //potentiometer values
-const int freq = 10; //temp value of 10 hz for frequency
+/*GLOBAL CONSTANTS
+-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 const int NUMVOICES = 4;
 const int bits_phase_accumulator = 32;
 const int Fs = 20000; //20k Hz sample rate
+
+//ADSR params
+int potA, potD, potR; //potentiometer values
 volatile unsigned long samplecnt = 0;
-volatile bool voicemixflag, envupdateflag, printflag, LEDflag = false;
+volatile bool voicemixflag, envupdateflag, midicompleteflag, printflag, LEDflag = false;
 uint16_t output = 0; //0-255
 int output_voltage; //0-5 volts
 const int WAVETABLE_SIZE = 256;
+//=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+//MIDI globals
+volatile uint8_t MIDIstatus, MIDInote, MIDIvelo, MIDIbyte_index;
+//=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 typedef enum {OFF, ATTACK, DECAY, SUSTAIN, RELEASE} EnvelopeStage;
 typedef enum {SINE, SQUARE, SAW, TRIANGLE} OscillatorType;
 
 typedef struct {
-  bool on; int name; uint16_t amp; uint8_t raw; uint8_t env_amp;
+  bool pressed; int name; uint16_t amp; uint8_t raw; uint8_t env_amp;
   EnvelopeStage stage; OscillatorType osc; 
   uint32_t phase; uint32_t phase_inc; unsigned long startcnt;
-  uint16_t envIndex; uint32_t f; //frequency
+  uint16_t envIndex; float f; //frequency
   uint8_t a_inc, d_inc, r_inc; //attack,decay,release increments
   uint8_t amp_before_r;
 } Voice;
 
 typedef struct {
-  volatile bool active; volatile int name;
+  volatile bool active; volatile uint8_t name;
 } Input;
 
 Voice edgar[NUMVOICES];
@@ -98,6 +103,14 @@ uint8_t Atable[WAVETABLE_SIZE];
 uint8_t Dtable[WAVETABLE_SIZE];
 uint8_t Rtable[WAVETABLE_SIZE];
 
+const float MIDIfreqtable[129] PROGMEM = {8.18,8.66,9.18,9.72,10.30,10.91,11.56,12.25,12.98,13.75,14.57,15.43,16.35, 17.32, 18.35, 19.45, 20.60, 21.83, 
+23.12, 24.50, 25.96, 27.50, 29.14, 30.87, 32.70, 34.65, 36.71, 38.89, 41.20, 43.65, 46.25, 49.00, 51.91, 55.00, 58.27, 61.74, 65.41, 69.30, 73.42, 77.78, 
+82.41, 87.31, 92.50, 98.00, 103.83, 110.00, 116.54, 123.47, 130.81, 138.59, 146.83, 155.56, 164.81, 174.61, 185.00, 196.00, 207.65, 220.00, 233.08, 246.94, 261.63, 
+277.18, 293.66, 311.13, 329.63, 349.23, 369.99, 392.00, 415.30, 440.00, 466.16, 493.88, 523.25, 554.37, 587.33, 622.25, 659.26, 698.46, 739.99, 783.99, 
+830.61, 880.00, 932.33, 987.77, 1046.50, 1108.73, 1174.66, 1244.51, 1318.51, 1396.91, 1479.98, 1567.98, 1661.22, 1760.00, 1864.66, 1975.53, 2093.00, 2217.46, 2349.32, 
+2489.02, 2637.02, 2793.83, 2959.96, 3135.96, 3322.44, 3520.00, 3729.31, 3951.07, 4186.01, 4434.92, 4698.64, 4978.03, 5274.04, 5587.65, 5919.91, 6271.93, 6644.88, 7040.00, 
+7458.62, 7902.13, 8372.02, 8869.84, 9397.27, 9956.06, 10548.08, 11175.30, 11839.82, 12543.85, 13289.75};
+
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 
 /*FUNCTION DECLARATIONS
@@ -106,11 +119,13 @@ uint8_t Rtable[WAVETABLE_SIZE];
 //void generate_wavetables();
 void generate_env_tables(EnvelopeStage stage, float lambda, float sustain, uint8_t * table);
 void init_voicearray(Voice *);
-void key_off(Voice *);
-void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs, int name);
+void key_release(Voice *);
+void key_off(Voice * v);
+void key_press(OscillatorType osc, unsigned long startcnt, uint8_t freq, Voice* v, int Fs, int name);
 uint8_t convertADSR(int);
 void incrementADSR(Voice* v);
-void printSerial(Voice* v);
+float midiNoteToFreq(uint8_t);
+
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 
 
@@ -118,6 +133,18 @@ void setup() {
   //PWM and GATE outputs
   pinMode(11, OUTPUT); //mixed output
   pinMode(3, OUTPUT); pinMode(5, OUTPUT); pinMode(6, OUTPUT); pinMode(9, OUTPUT); //individual voices
+  //MIDI setup
+  // Set baud rate to 31,250
+  UBRR0H = ((F_CPU / 16 + 31250 / 2) / 31250 - 1) >> 8;
+  UBRR0L = ((F_CPU / 16 + 31250 / 2) / 31250 - 1);
+  // 8 data bits
+  UCSR0C |= (1 << UCSZ01) | (1 << UCSZ00);
+  UCSR0B &= ~_BV(RXCIE0);  // disable Arduino's RX interrupt
+  UCSR0B &= ~_BV(RXEN0);   // disable Arduino's receive engine
+  // enable rx for MIDI:
+  UCSR0B |= _BV(RXEN0);
+  UCSR0B |= _BV(RXCIE0);
+
   //timer setup
   cli();
   TCCR1A = 0; // Normal operation 
@@ -130,24 +157,20 @@ void setup() {
   TCCR2A = _BV(COM2A1) | _BV(WGM21) | _BV(WGM20);  
   TCCR2B = _BV(CS20);  // No prescaler
   
-  Serial.println("set up timers");
-  //Serial.begin(31250); <- for MIDI
-  Serial.begin(115200);
+  //Serial.begin(115200);
   // initialize voices:
   init_voicearray(edgar);
 
   float lambda_decay = 0.02f;
   float lambda_release = 0.01f;
   float sustain = 0.5;
-  Serial.println("\nATTACK TABLE:"); generate_env_tables(ATTACK, 0, sustain, Atable);
-  Serial.println("\nDECAY TABLE"); generate_env_tables(DECAY, lambda_decay, sustain, Dtable);
-  Serial.println("\nRELEASE TABLE "); generate_env_tables(RELEASE, lambda_release, sustain, Rtable);
   sei();
 } //setup
 
 void loop() {
   // put your main code here, to run repeatedly:
   //input logic
+  /*
   if (Serial.available()) {
       int parse_int  = Serial.parseInt();
       if (parse_int < 1 || parse_int > 8) {
@@ -156,22 +179,58 @@ void loop() {
       }
       else {key.active = true; key.name = parse_int; Serial.print("Key inputted: "); Serial.println(key.name);}
   }
+  */
+
+  //input logic-- MIDI PARSING
+  //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+  if (midicompleteflag) {
+    //CASE: Note-On
+    if (MIDIstatus == 0x90 && MIDIvelo > 0) {
+      //find off voices first
+      unsigned long oldest_start = UINT32_MAX; int i_oldest = 0; bool foundoff = false;
+      for (int i=0; i<NUMVOICES; i++) {
+        if (edgar[i].stage == OFF) {
+          if (edgar[i].stage == OFF) {key_press(SINE, samplecnt, midiNoteToFreq(MIDInote), &edgar[i], Fs, MIDInote); foundoff=true; break;}
+          if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
+          //velocity not handled for now
+        }
+      }
+      //if none, find oldest voice to replace
+      if (foundoff==false) {key_press(SINE, samplecnt, midiNoteToFreq(MIDInote), &edgar[i_oldest], Fs, MIDInote);}
+    }
+    //CASE: Note-off
+    if (MIDIstatus == 0x80 || (MIDIstatus == 0x90 && MIDIvelo == 0)){
+      for (int i=0; i<NUMVOICES; i++) {
+        if (edgar[i].name == MIDInote)
+          {key_release(&edgar[i]); break;}
+      }
+    }
+  midicompleteflag = false;
+  } //midicompleteflag
+
+  /* OLD
   //voice allocation logic
   if (voicemixflag) {
-    unsigned long oldest_start = UINT32_MAX;; int i_oldest = 0; bool foundvoice = false;
+    unsigned long oldest_start = UINT32_MAX; int i_oldest = 0; bool foundexisting, foundoff = false;
       for (int i=0; i<NUMVOICES; i++) {
         //if a key is pressed a second time, turn it off
-        if (edgar[i].name == key.name) {key_off(&edgar[i]); foundvoice = true; break;}
-        //else, if a key i pressed for the first time, find a place for it
-        //find any off voices
-        if (edgar[i].on == false) {key_on(SINE, samplecnt, freq, &edgar[i], Fs, key.name); foundvoice=true; break;}
-        if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
+        if (edgar[i].name == key.name) {key_release(&edgar[i]); foundexisting = true; break;}
       }
-      //if no off voices found, replace the oldest
-      if (foundvoice==false) {key_on(SINE, samplecnt, freq, &edgar[i_oldest], Fs, key.name);}
-      key.active = false; //reset input event flag
-      voicemixflag = false; //reset ISR->voice allocation flag
+      if (foundexisting == false) {
+        for (int i=0; i<NUMVOICES; i++) {
+          //else, if a key i pressed for the first time, find a place for it
+          //find any off voices
+          if (edgar[i].stage == OFF) {key_press(SINE, samplecnt, freq, &edgar[i], Fs, key.name); foundoff=true; break;}
+          if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
+        }
+      }
+      //if no off/existing voices found, replace the oldest
+      if (foundexisting==false && foundoff==false) {key_press(SINE, samplecnt, freq, &edgar[i_oldest], Fs, key.name);}
+    key.active = false; //reset input event flag
+    voicemixflag = false; //reset ISR->voice allocation flag
   }
+  */
+  
   //envelope update logic
   if (envupdateflag) {
     /* I set a flag to be set active every 4 counts in ISR, and an if statement in loop() to handle envelope update logic. 
@@ -189,19 +248,19 @@ void loop() {
     }
     envupdateflag = false;
   }
-
+  /*
   if (printflag) {
     Serial.println("-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=");
     Serial.println("ON VOICES:");
     for (int i=0; i<NUMVOICES; i++) {
-      if (edgar[i].on) {
+      if (edgar[i].pressed) {
         Serial.println((String) "     name: "+ edgar[i].name + " stage: "+ edgar[i].stage +" amp: "+ edgar[i].env_amp);
       }
     }
     Serial.println("* * * * * * * * * * * * * * * * * * * * * * * * * ");
     Serial.println("OFF VOICES:");
     for (int i=0; i<NUMVOICES; i++) {
-      if (!edgar[i].on) {
+      if (!edgar[i].pressed) {
         Serial.println((String) "     name: "+ edgar[i].name + " stage: "+ edgar[i].stage +" pos: "+ i);
       }
     }
@@ -209,14 +268,13 @@ void loop() {
     Serial.println("-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-="); Serial.println();
 
     printflag = false;
-  }
+  } */
 
   if (LEDflag) {
     analogWrite(3, edgar[0].env_amp);
-    /*
-    ADD after getting my resistors:
+    
     analogWrite(5, edgar[1].env_amp); analogWrite(6, edgar[2].env_amp); analogWrite(9, edgar[3].env_amp);
-    */
+    
     LEDflag = false;
   }
 
@@ -266,9 +324,7 @@ ISR(TIMER1_COMPA_vect) {
   output /= NUMVOICES; // Normalize mixed output
   OCR2A = output;
 
-  //VOICE HANDLING
-  if ((samplecnt & 15) == 0)
-    if (key.active) voicemixflag = true;
+  //VOICE HANDLING DONE BY MIDI ISR
 
   //Update ENVELOPE
   if ((samplecnt & 39) == 0) envupdateflag = true; //run every 40 samples
@@ -279,7 +335,23 @@ ISR(TIMER1_COMPA_vect) {
   if ((samplecnt & 59999) == 0) printflag = true;
 } //ISR
 
+/*ISR for MIDI
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-*/
 
+ISR(USART_RX_vect) {
+  uint8_t byte = UDR0;
+  //3 bytes: status, data (note and velocity)
+  if (byte & 0x80){
+    //status byte
+    MIDIstatus = byte; MIDIbyte_index = 0;
+  }
+  else {
+    //data byte
+    if (MIDIbyte_index==0) {MIDInote = byte; MIDIbyte_index=1;}
+    else if (MIDIbyte_index==1) {
+      MIDIvelo = byte; midicompleteflag = true; MIDIbyte_index=0;}
+  }
+}
 
 /*USER_DEFINED_FXS
 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-*/
@@ -289,42 +361,45 @@ void generate_env_tables(EnvelopeStage stage, float lambda, float sustain, uint8
     for (int i = 0; i < WAVETABLE_SIZE; i++) {
             float val = 255.0f * expf(-lambda * i);
             if (val < 25) val = 0;
-            table[i] = (uint8_t)val; Serial.print(table[i]); Serial.print(",");
+            table[i] = (uint8_t)val; 
     }
   }
   else if (stage == DECAY) {
     for (int i = 0; i < WAVETABLE_SIZE; i++) {
       float e = expf(-lambda * i);
       float val = sustain + (1.0 - sustain) * e; 
-      table[i] = (uint8_t)(255.0f * val); Serial.print(table[i]); Serial.print(",");
+      table[i] = (uint8_t)(255.0f * val); 
     }
   }
   else if (stage == ATTACK) {
     for (int i = 0; i < WAVETABLE_SIZE; i++) {
       table[i] = (uint8_t) ((uint16_t)(i * i) / 255);
       //table[i] = (uint8_t)(255 * ( 1.0 * (float) pow((i / WAVETABLE_SIZE - 1), 2))); 
-      Serial.print(table[i]); Serial.print(",");
     }
   }
-  else {Serial.println("error: choose an envelope stage."); return;}
+  else {return;}
 }
 
 void init_voicearray(Voice * edgar) {
   for (int i=0; i<NUMVOICES; i++) {
-    edgar[i].on=false; edgar[i].amp=0; edgar[i].stage=OFF; edgar[i].osc=SINE; 
+    edgar[i].pressed=false; edgar[i].amp=0; edgar[i].stage=OFF; edgar[i].osc=SINE; 
     edgar[i].name = 67; edgar[i].phase = 0; edgar[i].phase_inc= 0; edgar[i].envIndex = 0; edgar[i].f = 20; // 20 hz
   } 
 }//init_voicearray
 
-void key_off(Voice * v) {
-  v->name = 67; v->on = false;
+void key_release(Voice * v) {
+  v->pressed = false;
 }
 
-void key_on(OscillatorType osc, unsigned long startcnt, int freq, Voice* v, int Fs, int name) {
+void key_off(Voice * v) {
+  v->stage = OFF; v->name = 67; v->env_amp=0;
+}
+
+void key_press(OscillatorType osc, unsigned long startcnt, uint8_t freq, Voice* v, int Fs, int name) {
   v->startcnt = startcnt; v->f = freq; v->stage = ATTACK; v->osc = osc;
   v->envIndex = 0; v->name = name;
-  v->phase_inc = (unsigned long) ((double)v->f * (unsigned long) (1 << bits_phase_accumulator) / Fs);
-  v->phase = 0; v-> on = true;
+  v->phase_inc = (unsigned long) ((float)v->f * (unsigned long) (1 << bits_phase_accumulator) / Fs);
+  v->phase = 0; v-> pressed = true;
   v->a_inc = convertADSR(potA); v->d_inc = convertADSR(potD); v->r_inc = convertADSR(potR);
 }
 
@@ -334,6 +409,9 @@ void incrementADSR(Voice* v) {
   //update envelope index & stages, handle overflow
   if (v->stage == ATTACK) {
     v->envIndex += v->a_inc;
+    if (!v->pressed) {
+      v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;
+    }
     if (v->envIndex >= WAVETABLE_SIZE)
       {v->stage = DECAY; v->envIndex -= WAVETABLE_SIZE;}
   }
@@ -342,24 +420,29 @@ void incrementADSR(Voice* v) {
     if (v->envIndex >= WAVETABLE_SIZE)
       {
         v->envIndex -= WAVETABLE_SIZE;
-        if (!v->on) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
+        if (!v->pressed) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
         else {v->stage = SUSTAIN;}
       }
   }
   else if (v->stage == SUSTAIN) {
-    if (!v->on) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
+    if (!v->pressed) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
   }
 
   else if (v->stage == RELEASE) {
     v->envIndex += v->r_inc;
-    if (v->envIndex >= WAVETABLE_SIZE) {v->stage = OFF; v->envIndex = 0;}
+    if (v->envIndex >= WAVETABLE_SIZE) {key_off(v);}
   }
 
   //update envelope amplitude
   switch (v->stage) {
     case ATTACK: v->env_amp = Atable[v->envIndex]; break;
     case DECAY: v->env_amp = Dtable[v->envIndex]; break;
-    case SUSTAIN: break; //keep amplitude constant
+    case SUSTAIN: v->env_amp = 128; break; //keep amplitude constant
     case RELEASE: v->env_amp = (Rtable[v->envIndex] * v->amp_before_r) >> 8; break;
   }
+}
+
+
+float midiNoteToFreq(uint8_t note) {
+	return pgm_read_byte(&MIDIfreqtable[note]);
 }
