@@ -12,6 +12,7 @@ test code for LAZULUM--test different functions with serial, breadboard, etc.
 #define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
 #endif //not necessrary for synth
 
+
 /* POLYPHONIC LOGIC STRUCTURE:
 ISR (20 kHz):    update oscillators, write audio
                  send flags to update envelopes, LFOs, voice allocation
@@ -20,23 +21,22 @@ main loop:       update envelopes & voice arr, handle serial i/o
 */
 /*GLOBAL CONSTANTS
 -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
-const int NUMVOICES = 4;
+const int NUMVOICES = 4; const int DEADNAME = -1;
 const int bits_phase_accumulator = 32;
 const int Fs = 20000; //20k Hz sample rate
-
+const int WAVETABLE_SIZE = 256;
 //ADSR params
-int potA, potD, potR; //potentiometer values
+uint8_t potA, potD, potR; //potentiometer values
 volatile unsigned long samplecnt = 0;
 volatile bool voicemixflag, envupdateflag, midicompleteflag, printflag, LEDflag = false;
 uint16_t output = 0; //0-255
-int output_voltage; //0-5 volts
-const int WAVETABLE_SIZE = 256;
+
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 //MIDI globals
 volatile uint8_t MIDIstatus, MIDInote, MIDIvelo, MIDIbyte_index;
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
-typedef enum {OFF, ATTACK, DECAY, SUSTAIN, RELEASE} EnvelopeStage;
-typedef enum {SINE, SQUARE, SAW, TRIANGLE} OscillatorType;
+typedef enum {IDLE, ATTACK, DECAY, SUSTAIN, RELEASE} EnvelopeStage;
+typedef enum {SINE, SQUARE, SAW, TRIANGLE, MOOG, SHARK, FORMANT, MS20, NUM_OSC_TYPES} OscillatorType;
 
 typedef struct {
   bool pressed; int name; uint16_t amp; uint8_t raw; uint8_t env_amp;
@@ -45,6 +45,7 @@ typedef struct {
   uint16_t envIndex; float f; //frequency
   uint8_t a_inc, d_inc, r_inc; //attack,decay,release increments
   uint8_t amp_before_r;
+  uint8_t * wavetable;
 } Voice;
 
 typedef struct {
@@ -52,27 +53,45 @@ typedef struct {
 } Input;
 
 Voice edgar[NUMVOICES];
-Input key {false, 67};
+Input key {false, DEADNAME};
+OscillatorType osctype; uint8_t osc_button_press_cnt;
 
 /*WAVETABLES
 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-*/
 const uint8_t sinetable[256] PROGMEM = {
-128,131,134,137,140,143,146,149,152,156,159,162,165,168,171,174,177,180,183,186,188,191,194,197,199,202,204,207,209,211,214,216,
-218,220,222,224,226,227,229,231,232,234,235,236,238,239,240,241,242,243,244,244,245,245,246,246,246,246,246,246,246,245,245,244,
-244,243,242,241,240,239,238,236,235,234,232,231,229,227,226,224,222,220,218,216,214,211,209,207,204,202,199,197,194,191,188,186,
-183,180,177,174,171,168,165,162,159,156,152,149,146,143,140,137,134,131,128,124,121,118,115,112,109,106,103, 99, 96, 93, 90, 87,
-84, 81, 78, 75, 73, 70, 67, 64, 62, 59, 57, 54, 52, 50, 47, 45,43, 41, 39, 37, 35, 34, 32, 30, 29, 27, 26, 25, 23, 22, 21, 20,
-19, 18, 17, 17, 16, 16, 15, 15, 15, 15, 15, 15, 15, 16, 16, 17,17, 18, 19, 20, 21, 22, 23, 25, 26, 27, 29, 30, 32, 34, 35, 37,
-39, 41, 43, 45, 47, 50, 52, 54, 57, 59, 62, 64, 67, 70, 73, 75,78, 81, 84, 87, 90, 93, 96, 99,103,106,109,112,115,118,121,124
+ 128,131,134,137,140,143,146,149,152,156,159,162,165,168,171,174,
+ 177,180,183,186,188,191,194,197,199,202,204,207,209,211,214,216,
+ 218,220,222,224,226,227,229,231,232,234,235,236,238,239,240,241,
+ 242,243,244,244,245,245,246,246,246,246,246,246,246,245,245,244,
+ 244,243,242,241,240,239,238,236,235,234,232,231,229,227,226,224,
+ 222,220,218,216,214,211,209,207,204,202,199,197,194,191,188,186,
+ 183,180,177,174,171,168,165,162,159,156,152,149,146,143,140,137,
+ 134,131,128,124,121,118,115,112,109,106,103, 99, 96, 93, 90, 87,
+  84, 81, 78, 75, 73, 70, 67, 64, 62, 59, 57, 54, 52, 50, 47, 45,
+  43, 41, 39, 37, 35, 34, 32, 30, 29, 27, 26, 25, 23, 22, 21, 20,
+  19, 18, 17, 17, 16, 16, 15, 15, 15, 15, 15, 15, 15, 16, 16, 17,
+  17, 18, 19, 20, 21, 22, 23, 25, 26, 27, 29, 30, 32, 34, 35, 37,
+  39, 41, 43, 45, 47, 50, 52, 54, 57, 59, 62, 64, 67, 70, 73, 75,
+  78, 81, 84, 87, 90, 93, 96, 99,103,106,109,112,115,118,121,124
 };
 
 const uint8_t squaretable[256] PROGMEM = {
-255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ 255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+ 255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+ 255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+ 255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+ 255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+ 255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+ 255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+ 255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
 };
 
 const uint8_t sawtable[256] PROGMEM = {
@@ -80,24 +99,103 @@ const uint8_t sawtable[256] PROGMEM = {
  32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
  64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
  96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,
-128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
-160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
-192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
-224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+  128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+  160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+  192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+  224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
 };
 
 const uint8_t triangletable[256] PROGMEM = {
   // Rising
-0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,
-64,66,68,70,72,74,76,78,80,82,84,86,88,90,92,94,96,98,100,102,104,106,108,110,112,114,116,118,120,122,124,126,
-128,130,132,134,136,138,140,142,144,146,148,150,152,154,156,158,160,162,164,166,168,170,172,174,176,178,180,182,184,186,188,190,
-192,194,196,198,200,202,204,206,208,210,212,214,216,218,220,222,224,226,228,230,232,234,236,238,240,242,244,246,248,250,252,254,
-  // Falling
-255,253,251,249,247,245,243,241,239,237,235,233,231,229,227,225,223,221,219,217,215,213,211,209,207,205,203,201,199,197,195,193,
-191,189,187,185,183,181,179,177,175,173,171,169,167,165,163,161,159,157,155,153,151,149,147,145,143,141,139,137,135,133,131,129,
-127,125,123,121,119,117,115,113,111,109,107,105,103,101, 99, 97, 95, 93, 91, 89, 87, 85, 83, 81, 79, 77, 75, 73, 71, 69, 67, 65,
-63, 61, 59, 57, 55, 53, 51, 49, 47, 45, 43, 41, 39, 37, 35, 33, 31, 29, 27, 25, 23, 21, 19, 17, 15, 13, 11,  9,  7,  5,  3,  1
+  0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,
+  64,66,68,70,72,74,76,78,80,82,84,86,88,90,92,94,96,98,100,102,104,106,108,110,112,114,116,118,120,122,124,126,
+  128,130,132,134,136,138,140,142,144,146,148,150,152,154,156,158,160,162,164,166,168,170,172,174,176,178,180,182,184,186,188,190,
+  192,194,196,198,200,202,204,206,208,210,212,214,216,218,220,222,224,226,228,230,232,234,236,238,240,242,244,246,248,250,252,254,
+    // Falling
+  255,253,251,249,247,245,243,241,239,237,235,233,231,229,227,225,223,221,219,217,215,213,211,209,207,205,203,201,199,197,195,193,
+  191,189,187,185,183,181,179,177,175,173,171,169,167,165,163,161,159,157,155,153,151,149,147,145,143,141,139,137,135,133,131,129,
+  127,125,123,121,119,117,115,113,111,109,107,105,103,101, 99, 97, 95, 93, 91, 89, 87, 85, 83, 81, 79, 77, 75, 73, 71, 69, 67, 65,
+  63, 61, 59, 57, 55, 53, 51, 49, 47, 45, 43, 41, 39, 37, 35, 33, 31, 29, 27, 25, 23, 21, 19, 17, 15, 13, 11,  9,  7,  5,  3,  1
 };
+
+const uint8_t moogtable[256] PROGMEM = {
+  255,255,255,255,255,255,255,255,255,255,255,255,253,250,248,245,
+  243,240,238,236,234,232,231,229,228,227,226,225,224,224,223,223,
+  223,223,223,223,224,224,225,226,227,228,229,231,232,234,236,238,
+  240,243,245,248,250,253,255,255,255,255,255,255,255,255,255,255,
+  255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+  253,250,248,245,243,240,238,236,234,232,231,229,228,227,226,225,
+  224,224,223,223,223,223,223,223,224,224,225,226,227,228,229,231,
+  232,234,236,238,240,243,245,248,250,253,255,255,255,255,255,255,
+  0,0,0,0,0,0,0,0,0,0,0,0,2,5,7,10,
+  12,15,17,19,21,23,24,26,27,28,29,30,31,31,32,32,
+  32,32,32,32,31,31,30,29,28,27,26,24,23,21,19,17,
+  15,12,10,7,5,2,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+  2,5,7,10,12,15,17,19,21,23,24,26,27,28,29,30,
+  31,31,32,32,32,32,32,32,31,31,30,29,28,27,26,24,
+  23,21,19,17,15,12,10,7,5,2,0,0,0,0,0,0
+};
+
+const uint8_t sharktable[256] PROGMEM = {
+  0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+  16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+  32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
+  48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+  64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,
+  80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
+  96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,
+  112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,
+  160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,
+  176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+  192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,
+  208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+  224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,
+  240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255,
+  255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+  255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255
+};
+
+
+const uint8_t formanttable[256] PROGMEM = {
+  128,131,135,139,143,147,151,155,159,162,166,169,172,175,178,180,
+  182,184,186,188,189,190,191,192,192,192,192,191,190,189,187,185,
+  183,181,178,175,172,169,165,161,157,153,148,144,139,134,129,124,
+  119,114,109,104,100,95,91,87,83,80,77,74,72,70,69,68,
+  68,68,69,70,72,74,77,80,83,87,91,95,100,104,109,114,
+  119,124,129,134,139,144,148,153,157,161,165,169,172,175,178,181,
+  183,185,187,189,190,191,192,192,192,192,191,190,189,188,186,184,
+  182,180,178,175,172,169,166,162,159,155,151,147,143,139,135,131,
+  128,125,121,117,113,109,105,101,97,94,90,87,84,81,78,76,
+  74,72,70,68,67,66,65,64,64,64,64,65,66,67,69,71,
+  73,75,78,81,84,87,90,94,97,101,105,109,113,117,121,125,
+  128,131,135,139,143,147,151,155,159,162,166,169,172,175,178,180,
+  182,184,186,188,189,190,191,192,192,192,192,191,190,189,187,185,
+  183,181,178,175,172,169,165,161,157,153,148,144,139,134,129,124,
+  119,114,109,104,100,95,91,87,83,80,77,74,72,70,69,68,
+  68,68,69,70,72,74,77,80,83,87,91,95,100,104,109,114
+};
+
+const uint8_t ms20table[256] PROGMEM = {
+  0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,
+  64,68,72,76,80,84,88,92,96,100,104,108,112,116,120,124,
+  128,132,136,140,144,148,152,156,160,164,168,172,176,180,184,188,
+  192,196,200,204,208,212,216,220,224,228,232,236,240,244,248,252,
+  255,250,245,240,235,230,225,220,215,210,205,200,195,190,185,180,
+  175,170,165,160,155,150,145,140,135,130,125,120,115,110,105,100,
+  95,90,85,80,75,70,65,60,55,50,45,40,35,30,25,20,
+  15,10,5,0,5,10,15,20,25,30,35,40,45,50,55,60,
+  65,70,75,80,85,90,95,100,105,110,115,120,125,130,135,140,
+  145,150,155,160,165,170,175,180,185,190,195,200,205,210,215,220,
+  225,230,235,240,245,250,255,250,245,240,235,230,225,220,215,210,
+  205,200,195,190,185,180,175,170,165,160,155,150,145,140,135,130,
+  125,120,115,110,105,100,95,90,85,80,75,70,65,60,55,50,
+  45,40,35,30,25,20,15,10,5,0,5,10,15,20,25,30,
+  35,40,45,50,55,60,65,70,75,80,85,90,95,100,105,110,
+  115,120,125,130,135,140,145,150,155,160,165,170,175,180,185,190
+};
+
+
 //asdr tables
 uint8_t Atable[WAVETABLE_SIZE];
 uint8_t Dtable[WAVETABLE_SIZE];
@@ -121,11 +219,12 @@ void generate_env_tables(EnvelopeStage stage, float lambda, float sustain, uint8
 void init_voicearray(Voice *);
 void key_release(Voice *);
 void key_off(Voice * v);
-void key_press(OscillatorType osc, unsigned long startcnt, uint8_t freq, Voice* v, int Fs, int name);
+void key_press(OscillatorType osc, unsigned long startcnt, float freq, Voice* v, int Fs, int name);
 uint8_t convertADSR(int);
 void incrementADSR(Voice* v);
 float midiNoteToFreq(uint8_t);
-
+void errorTrap(int line, int idx);
+void incrementADSR_OLD(Voice* v);
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 
 
@@ -133,6 +232,11 @@ void setup() {
   //PWM and GATE outputs
   pinMode(11, OUTPUT); //mixed output
   pinMode(3, OUTPUT); pinMode(5, OUTPUT); pinMode(6, OUTPUT); pinMode(9, OUTPUT); //individual voices
+  pinMode(A1, INPUT); pinMode(A2, INPUT); pinMode(A3, INPUT); //pot inputs adsr
+  pinMode(13, INPUT_PULLUP); //button to toggle oscillator mode
+  pinMode(7, OUTPUT); //error button for voices going out of bounds
+  digitalWrite(7, LOW);
+  osc_button_press_cnt = 0;
   //MIDI setup
   // Set baud rate to 31,250
   UBRR0H = ((F_CPU / 16 + 31250 / 2) / 31250 - 1) >> 8;
@@ -187,22 +291,31 @@ void loop() {
     //CASE: Note-On
     if (MIDIstatus == 0x90 && MIDIvelo > 0) {
       //find off voices first
+      potA = analogRead(A1); potD = analogRead(A2); potR = analogRead(A3); 
       unsigned long oldest_start = UINT32_MAX; int i_oldest = 0; bool foundoff = false;
       for (int i=0; i<NUMVOICES; i++) {
-        if (edgar[i].stage == OFF) {
-          if (edgar[i].stage == OFF) {key_press(SINE, samplecnt, midiNoteToFreq(MIDInote), &edgar[i], Fs, MIDInote); foundoff=true; break;}
+          if (edgar[i].stage == IDLE) {key_press(osctype, samplecnt, midiNoteToFreq(MIDInote), &edgar[i], Fs, MIDInote); foundoff=true; break;}
           if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
           //velocity not handled for now
-        }
       }
       //if none, find oldest voice to replace
-      if (foundoff==false) {key_press(SINE, samplecnt, midiNoteToFreq(MIDInote), &edgar[i_oldest], Fs, MIDInote);}
+      if (foundoff==false) {key_press(osctype, samplecnt, midiNoteToFreq(MIDInote), &edgar[i_oldest], Fs, MIDInote);}
     }
     //CASE: Note-off
     if (MIDIstatus == 0x80 || (MIDIstatus == 0x90 && MIDIvelo == 0)){
       for (int i=0; i<NUMVOICES; i++) {
         if (edgar[i].name == MIDInote)
           {key_release(&edgar[i]); break;}
+      }
+    }
+    //DEBUG: check for ZOMBIE voices
+    for (int i=0; i<NUMVOICES-1; i++){
+      Voice * v1 = &edgar[i];
+      if(v1->name == DEADNAME) continue;
+      for (int j=i+1; j<NUMVOICES; j++) {
+        Voice * v2 = &edgar[j];
+        if(v2->name == DEADNAME) continue;
+        if (v1->name == v2->name) digitalWrite(7, HIGH);
       }
     }
   midicompleteflag = false;
@@ -244,7 +357,7 @@ void loop() {
     
     //increment thru ADR wavetables
     for (int i=0; i<NUMVOICES; i++) {
-      incrementADSR(&edgar[i]); //updates envIndex, stage, and env_amp
+      incrementADSR_OLD(&edgar[i]); //updates envIndex, stage, and env_amp
     }
     envupdateflag = false;
   }
@@ -274,10 +387,18 @@ void loop() {
     analogWrite(3, edgar[0].env_amp);
     
     analogWrite(5, edgar[1].env_amp); analogWrite(6, edgar[2].env_amp); analogWrite(9, edgar[3].env_amp);
-    
+
+    if (digitalRead(13) == LOW) {
+      osc_button_press_cnt++;
+      if (osc_button_press_cnt >= NUM_OSC_TYPES)
+        osc_button_press_cnt = 0;
+      osctype = (OscillatorType) osc_button_press_cnt;
+    }
     LEDflag = false;
   }
 
+
+  
 } //loop()
 
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
@@ -302,28 +423,23 @@ ISR(TIMER1_COMPA_vect) {
   */
   samplecnt++;
   //WAVETABLE GENERATION /
+  output = 0;
   for (int i=0; i<NUMVOICES; i++) {
-    if (edgar[i].stage != OFF) {
-      // PHASE ACCUMULATION
-      edgar[i].phase += edgar[i].phase_inc;
-      //WAVETABLE--just raw oscillation
-      switch (edgar[i].osc) {
-        case SINE: edgar[i].raw = pgm_read_byte(&sinetable[edgar[i].phase >> 24]); break;
-        case SQUARE: edgar[i].raw = pgm_read_byte(&squaretable[edgar[i].phase >> 24]); break;
-        case SAW: edgar[i].raw = pgm_read_byte(&sawtable[edgar[i].phase >> 24]); break;
-        case TRIANGLE: edgar[i].raw = pgm_read_byte(&triangletable[edgar[i].phase >> 24]); break;
-      }
-      //WAVETABLE--envelope-scaled oscillation
-      edgar[i].amp = (uint16_t)edgar[i].raw * (uint16_t)edgar[i].env_amp >> 8; //
-    }
-    else {edgar[i].raw =0; edgar[i].amp = 0;}
+    Voice * v = &edgar[i];
+    if (v->env_amp == 0) continue;
+    // PHASE ACCUMULATION
+    v->phase += v->phase_inc;
+    //WAVETABLE--just raw oscillation
+    //v->raw = pgm_read_byte(&sinetable[edgar[i].phase >> 24]);
+    v->raw = pgm_read_byte(v->wavetable[v->phase >> 24]);
+    //WAVETABLE--envelope-scaled oscillation
+    v->amp = (uint16_t)edgar[i].raw * (uint16_t)edgar[i].env_amp >> 8; //
+    output += v->amp;
   }//for
   //VOICE MIXING
-  output = 0;
-  for (int i = 0; i < NUMVOICES; i++) output += edgar[i].amp;
-  output /= NUMVOICES; // Normalize mixed output
+  output >>= NUMVOICES; // Normalize mixed output
   OCR2A = output;
-
+  
   //VOICE HANDLING DONE BY MIDI ISR
 
   //Update ENVELOPE
@@ -382,8 +498,8 @@ void generate_env_tables(EnvelopeStage stage, float lambda, float sustain, uint8
 
 void init_voicearray(Voice * edgar) {
   for (int i=0; i<NUMVOICES; i++) {
-    edgar[i].pressed=false; edgar[i].amp=0; edgar[i].stage=OFF; edgar[i].osc=SINE; 
-    edgar[i].name = 67; edgar[i].phase = 0; edgar[i].phase_inc= 0; edgar[i].envIndex = 0; edgar[i].f = 20; // 20 hz
+    edgar[i].pressed=false; edgar[i].amp=0; edgar[i].stage=IDLE; edgar[i].osc=SINE; 
+    edgar[i].name = DEADNAME; edgar[i].phase = 0; edgar[i].phase_inc= 0; edgar[i].envIndex = 0; edgar[i].f = 20; // 20 hz
   } 
 }//init_voicearray
 
@@ -392,20 +508,29 @@ void key_release(Voice * v) {
 }
 
 void key_off(Voice * v) {
-  v->stage = OFF; v->name = 67; v->env_amp=0;
+  v->stage = IDLE; v->name = DEADNAME; v->env_amp=0;
 }
 
-void key_press(OscillatorType osc, unsigned long startcnt, uint8_t freq, Voice* v, int Fs, int name) {
+void key_press(OscillatorType osc, unsigned long startcnt, float freq, Voice* v, int Fs, int name) {
   v->startcnt = startcnt; v->f = freq; v->stage = ATTACK; v->osc = osc;
   v->envIndex = 0; v->name = name;
   v->phase_inc = (unsigned long) ((float)v->f * (unsigned long) (1 << bits_phase_accumulator) / Fs);
   v->phase = 0; v-> pressed = true;
   v->a_inc = convertADSR(potA); v->d_inc = convertADSR(potD); v->r_inc = convertADSR(potR);
+  switch (osc) {
+        case SINE: v->wavetable = sinetable; break;
+        case SQUARE: v->wavetable = squaretable; break;
+        case SAW: v->wavetable = sawtable; break;
+        case MOOG: v->wavetable = moogtable; break;
+        case SHARK: v->wavetable = sharktable; break;
+        case FORMANT: v->wavetable = formanttable; break;
+        case MS20: v->wavetable = ms20table; break;
+      } 
 }
 
-uint8_t convertADSR(int pot) {return 1 + (pot * (WAVETABLE_SIZE - 1)) / 1023;}
+uint8_t convertADSR(uint8_t pot) {return 1 + (pot * (WAVETABLE_SIZE - 1)) / 1023;}
 
-void incrementADSR(Voice* v) {
+void incrementADSR_OLD(Voice* v) {
   //update envelope index & stages, handle overflow
   if (v->stage == ATTACK) {
     v->envIndex += v->a_inc;
@@ -442,6 +567,35 @@ void incrementADSR(Voice* v) {
   }
 }
 
+
+void incrementADSR(Voice* v) {
+  //if a key has been let go, enter release
+  if (v->pressed == false && v->stage != IDLE && v->stage != RELEASE) {
+    v->stage = RELEASE; v->amp_before_r = v->amp; v->envIndex = 0;}
+  //update envelopes & stages
+  switch (v->stage) {
+    case ATTACK: 
+      v->envIndex += v->a_inc;
+      if (v->envIndex >= WAVETABLE_SIZE)
+        {v->stage = DECAY; v->envIndex = 0;}
+      v->env_amp = Atable[v->envIndex];
+      break;
+    case DECAY:
+      v->envIndex += v->d_inc;
+      if (v->envIndex >= WAVETABLE_SIZE)
+        {v->stage = SUSTAIN; v->envIndex = 0;}
+      v->env_amp = Dtable[v->envIndex]; 
+      break;
+    case SUSTAIN: 
+      v->env_amp = WAVETABLE_SIZE/4; 
+      break;
+    case RELEASE:
+      v->envIndex += v->r_inc;
+      if (v->envIndex >= WAVETABLE_SIZE) {key_off(v);}
+      v->env_amp = (Rtable[v->envIndex] * v->amp_before_r) >> 8; 
+      break;
+  }
+} //incrementADSR_NEW
 
 float midiNoteToFreq(uint8_t note) {
 	return pgm_read_byte(&MIDIfreqtable[note]);
