@@ -10,8 +10,11 @@ test code for LAZULUM--test different functions with serial, breadboard, etc.
 
 #ifndef sbi
 #define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
+#define F_CPU  16000000 //timer clock runs at 16MHz
+
 #endif //not necessrary for synth
 
+#define BLINK(pin, ms, blinks) do {cli(); for (int i=0; i<blinks; i++) { digitalWrite(pin, HIGH); delay(ms); digitalWrite(pin, LOW); delay(ms);} sei();} while (0)
 
 /* POLYPHONIC LOGIC STRUCTURE:
 ISR (20 kHz):    update oscillators, write audio
@@ -23,12 +26,17 @@ main loop:       update envelopes & voice arr, handle serial i/o
 -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 const int NUMVOICES = 4; const int DEADNAME = -1;
 const int bits_phase_accumulator = 32;
-const int Fs = 20000; //20k Hz sample rate
+const int SAMPLE_RATE = 20000; //20k Hz sample rate
 const int WAVETABLE_SIZE = 256;
+int prescaler_timer1 = 1; //hardcoded for now, determined by TCCR1B
+const uint16_t ISR_MARGIN = 50; //measured in ticks
+const uint16_t FRAME_TICKS = (F_CPU / (prescaler_timer1 * SAMPLE_RATE)); //how many ticks between interrupts
+const uint16_t WCET_TICKS = 650; //estimated worst case scenario for ISR code to take to execute
+const uint16_t SAFE_LIMIT = FRAME_TICKS - WCET_TICKS - ISR_MARGIN; // if this is exceeded, break the ISR for that instance
 //ADSR params
 uint8_t potA, potD, potR; //potentiometer values
 volatile unsigned long samplecnt = 0;
-volatile bool voicemixflag, envupdateflag, midicompleteflag, printflag, LEDflag = false;
+volatile bool voicemixflag, envupdateflag, midicompleteflag, printflag, LEDflag, safeguardflag = false;
 uint16_t output = 0; //0-255
 
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
@@ -219,7 +227,7 @@ void generate_env_tables(EnvelopeStage stage, float lambda, float sustain, uint8
 void init_voicearray(Voice *);
 void key_release(Voice *);
 void key_off(Voice * v);
-void key_press(OscillatorType osc, unsigned long startcnt, float freq, Voice* v, int Fs, int name);
+void key_press(OscillatorType osc, unsigned long startcnt, float freq, Voice* v, int SAMPLE_RATE, int name);
 uint8_t convertADSR(int);
 void incrementADSR(Voice* v);
 float midiNoteToFreq(uint8_t);
@@ -236,6 +244,7 @@ void setup() {
   pinMode(13, INPUT_PULLUP); //button to toggle oscillator mode
   pinMode(7, OUTPUT); //error button for voices going out of bounds
   digitalWrite(7, LOW);
+  BLINK(7, 100, 3);
   osc_button_press_cnt = 0;
   //MIDI setup
   // Set baud rate to 31,250
@@ -253,10 +262,11 @@ void setup() {
   cli();
   TCCR1A = 0; // Normal operation 
   TCCR1B = 0; TCNT1 = 0; 
-  OCR1A = 799; // For 20kHz: 16MHz / (20,000 * 1) - 1 = 799 
   TCCR1B |= (1 << WGM12); // CTC mode 
   TCCR1B |= (1 << CS10); // No prescaler 
   TIMSK1 |= (1 << OCIE1A); // Enable compare interrupt
+  prescaler_timer1 = 1;
+  OCR1A = (F_CPU / (prescaler_timer1 * SAMPLE_RATE)) - 1; 
   //timer 2 setup, for PWM
   TCCR2A = _BV(COM2A1) | _BV(WGM21) | _BV(WGM20);  
   TCCR2B = _BV(CS20);  // No prescaler
@@ -294,12 +304,12 @@ void loop() {
       potA = analogRead(A1); potD = analogRead(A2); potR = analogRead(A3); 
       unsigned long oldest_start = UINT32_MAX; int i_oldest = 0; bool foundoff = false;
       for (int i=0; i<NUMVOICES; i++) {
-          if (edgar[i].stage == IDLE) {key_press(osctype, samplecnt, midiNoteToFreq(MIDInote), &edgar[i], Fs, MIDInote); foundoff=true; break;}
+          if (edgar[i].stage == IDLE) {key_press(osctype, samplecnt, midiNoteToFreq(MIDInote), &edgar[i], SAMPLE_RATE, MIDInote); foundoff=true; break;}
           if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
           //velocity not handled for now
       }
       //if none, find oldest voice to replace
-      if (foundoff==false) {key_press(osctype, samplecnt, midiNoteToFreq(MIDInote), &edgar[i_oldest], Fs, MIDInote);}
+      if (foundoff==false) {key_press(osctype, samplecnt, midiNoteToFreq(MIDInote), &edgar[i_oldest], SAMPLE_RATE, MIDInote);}
     }
     //CASE: Note-off
     if (MIDIstatus == 0x80 || (MIDIstatus == 0x90 && MIDIvelo == 0)){
@@ -309,6 +319,7 @@ void loop() {
       }
     }
     //DEBUG: check for ZOMBIE voices
+    /*
     for (int i=0; i<NUMVOICES-1; i++){
       Voice * v1 = &edgar[i];
       if(v1->name == DEADNAME) continue;
@@ -318,6 +329,7 @@ void loop() {
         if (v1->name == v2->name) digitalWrite(7, HIGH);
       }
     }
+  */
   midicompleteflag = false;
   } //midicompleteflag
 
@@ -333,12 +345,12 @@ void loop() {
         for (int i=0; i<NUMVOICES; i++) {
           //else, if a key i pressed for the first time, find a place for it
           //find any off voices
-          if (edgar[i].stage == OFF) {key_press(SINE, samplecnt, freq, &edgar[i], Fs, key.name); foundoff=true; break;}
+          if (edgar[i].stage == OFF) {key_press(SINE, samplecnt, freq, &edgar[i], SAMPLE_RATE, key.name); foundoff=true; break;}
           if (edgar[i].startcnt < oldest_start) {oldest_start = edgar[i].startcnt; i_oldest = i;}
         }
       }
       //if no off/existing voices found, replace the oldest
-      if (foundexisting==false && foundoff==false) {key_press(SINE, samplecnt, freq, &edgar[i_oldest], Fs, key.name);}
+      if (foundexisting==false && foundoff==false) {key_press(SINE, samplecnt, freq, &edgar[i_oldest], SAMPLE_RATE, key.name);}
     key.active = false; //reset input event flag
     voicemixflag = false; //reset ISR->voice allocation flag
   }
@@ -357,7 +369,7 @@ void loop() {
     
     //increment thru ADR wavetables
     for (int i=0; i<NUMVOICES; i++) {
-      incrementADSR_OLD(&edgar[i]); //updates envIndex, stage, and env_amp
+      incrementADSR(&edgar[i]); //updates envIndex, stage, and env_amp
     }
     envupdateflag = false;
   }
@@ -394,6 +406,8 @@ void loop() {
         osc_button_press_cnt = 0;
       osctype = (OscillatorType) osc_button_press_cnt;
     }
+    if (safeguardflag) digitalWrite(7, HIGH); else digitalWrite(7, LOW);
+    safeguardflag = false;
     LEDflag = false;
   }
 
@@ -421,6 +435,8 @@ ISR(TIMER1_COMPA_vect) {
          update voices
 
   */
+  //SAFEGUARD CODE: if the ISR is already too late to finish in time, break that instance
+  if (TCNT1 > SAFE_LIMIT) {safeguardflag = true; return;}
   samplecnt++;
   //WAVETABLE GENERATION /
   output = 0;
@@ -436,6 +452,7 @@ ISR(TIMER1_COMPA_vect) {
     v->amp = (uint16_t)edgar[i].raw * (uint16_t)edgar[i].env_amp >> 8; //
     output += v->amp;
   }//for
+  
   //VOICE MIXING
   output >>= NUMVOICES; // Normalize mixed output
   OCR2A = output;
@@ -455,6 +472,9 @@ ISR(TIMER1_COMPA_vect) {
 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-*/
 
 ISR(USART_RX_vect) {
+  if (UCSR0A & _BV(DOR0)) { //in case of data overrun, reset MIDI input
+    digitalWrite(7, HIGH);
+  }
   uint8_t byte = UDR0;
   //3 bytes: status, data (note and velocity)
   if (byte & 0x80){
@@ -511,10 +531,11 @@ void key_off(Voice * v) {
   v->stage = IDLE; v->name = DEADNAME; v->env_amp=0;
 }
 
-void key_press(OscillatorType osc, unsigned long startcnt, float freq, Voice* v, int Fs, int name) {
+void key_press(OscillatorType osc, unsigned long startcnt, float freq, Voice* v, int SAMPLE_RATE, int name) {
   v->startcnt = startcnt; v->f = freq; v->stage = ATTACK; v->osc = osc;
-  v->envIndex = 0; v->name = name;
-  v->phase_inc = (unsigned long) ((float)v->f * (unsigned long) (1 << bits_phase_accumulator) / Fs);
+  cli(); v->envIndex = 0; sei();
+  v->name = name;
+  v->phase_inc = (unsigned long) ((float)v->f * (unsigned long) (1 << bits_phase_accumulator) / SAMPLE_RATE);
   v->phase = 0; v-> pressed = true;
   v->a_inc = convertADSR(potA); v->d_inc = convertADSR(potD); v->r_inc = convertADSR(potR);
   switch (osc) {
@@ -545,12 +566,12 @@ void incrementADSR_OLD(Voice* v) {
     if (v->envIndex >= WAVETABLE_SIZE)
       {
         v->envIndex -= WAVETABLE_SIZE;
-        if (!v->pressed) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
+        if (!v->pressed) {v->stage = RELEASE; cli(); v->envIndex = 0; sei(); v->amp_before_r = v->env_amp;}
         else {v->stage = SUSTAIN;}
       }
   }
   else if (v->stage == SUSTAIN) {
-    if (!v->pressed) {v->stage = RELEASE; v->envIndex = 0; v->amp_before_r = v->env_amp;}
+    if (!v->pressed) {v->stage = RELEASE; cli(); v->envIndex = 0; sei(); v->amp_before_r = v->env_amp;}
   }
 
   else if (v->stage == RELEASE) {
@@ -571,23 +592,23 @@ void incrementADSR_OLD(Voice* v) {
 void incrementADSR(Voice* v) {
   //if a key has been let go, enter release
   if (v->pressed == false && v->stage != IDLE && v->stage != RELEASE) {
-    v->stage = RELEASE; v->amp_before_r = v->amp; v->envIndex = 0;}
+    v->stage = RELEASE; v->amp_before_r = v->amp; cli(); v->envIndex = 0; sei();}
   //update envelopes & stages
   switch (v->stage) {
     case ATTACK: 
       v->envIndex += v->a_inc;
       if (v->envIndex >= WAVETABLE_SIZE)
-        {v->stage = DECAY; v->envIndex = 0;}
+        {v->stage = DECAY; cli(); v->envIndex = 0; sei();}
       v->env_amp = Atable[v->envIndex];
       break;
     case DECAY:
       v->envIndex += v->d_inc;
       if (v->envIndex >= WAVETABLE_SIZE)
-        {v->stage = SUSTAIN; v->envIndex = 0;}
+        {v->stage = SUSTAIN; cli(); v->envIndex = 0; sei();}
       v->env_amp = Dtable[v->envIndex]; 
       break;
     case SUSTAIN: 
-      v->env_amp = WAVETABLE_SIZE/4; 
+      v->env_amp = WAVETABLE_SIZE >> 2; 
       break;
     case RELEASE:
       v->envIndex += v->r_inc;
